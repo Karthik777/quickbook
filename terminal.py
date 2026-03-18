@@ -1,96 +1,96 @@
 """Async PTY WebSocket handler for the inline terminal."""
 import asyncio
-import os
-import pty
 import fcntl
-import termios
+import json
+import os
 import struct
-import signal
-from typing import Callable
+import subprocess
+import termios
+from typing import Callable, Awaitable
 
 
-class PtyTerminal:
+class PtySession:
+    """
+    Persistent PTY bash session bridged to WebSocket.
+    Uses pty.openpty() + subprocess + loop.add_reader() for event-driven I/O.
+    One instance shared across all terminal WebSocket connections.
+    """
+
     def __init__(self):
         self.master_fd: int | None = None
-        self.pid: int | None = None
-        self._read_task: asyncio.Task | None = None
+        self._proc: subprocess.Popen | None = None
+        self._subscribers: set[Callable] = set()
 
-    def spawn(self, shell: str = "/bin/bash"):
-        """Fork a PTY running shell. Call once per WebSocket connection."""
-        self.pid, self.master_fd = pty.fork()
-        if self.pid == 0:
-            # Child process — replace with shell
-            os.execvp(shell, [shell])
-        # Parent: set non-blocking I/O on master fd
+    async def start(self):
+        """Spawn bash with a PTY. Safe to call once."""
+        import pty
+        self.master_fd, slave_fd = pty.openpty()
+        self._proc = subprocess.Popen(
+            ["/bin/bash", "--login"],
+            stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+            close_fds=True,
+            env={**os.environ, "TERM": "xterm-256color"},
+        )
+        os.close(slave_fd)  # parent holds master end only
+
+        # Non-blocking reads on master fd
         flags = fcntl.fcntl(self.master_fd, fcntl.F_GETFL)
         fcntl.fcntl(self.master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
 
-    def resize(self, rows: int, cols: int):
-        """Notify PTY of terminal resize."""
-        if self.master_fd is None:
+        # Register event-driven reader on the event loop
+        loop = asyncio.get_event_loop()
+        loop.add_reader(self.master_fd, self._on_readable)
+
+    def _on_readable(self):
+        """Called by the event loop when master_fd has data — no polling needed."""
+        try:
+            data = os.read(self.master_fd, 4096)
+        except OSError:
             return
-        size = struct.pack("HHHH", rows, cols, 0, 0)
-        fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, size)
+        if data and self._subscribers:
+            for send_fn in list(self._subscribers):
+                asyncio.ensure_future(send_fn(data.decode(errors="replace")))
 
     async def write(self, data: str | bytes):
-        """Send keystrokes to PTY."""
         if self.master_fd is None:
             return
         if isinstance(data, str):
             data = data.encode()
         await asyncio.to_thread(os.write, self.master_fd, data)
 
-    async def read_loop(self, send: Callable):
-        """Continuously read PTY output and forward via WebSocket send callback."""
-        loop = asyncio.get_event_loop()
-        while self.master_fd is not None:
-            try:
-                data = await asyncio.to_thread(self._read_chunk)
-                if data:
-                    await send(data.decode(errors="replace"))
-            except OSError:
-                # PTY closed
-                break
-            await asyncio.sleep(0.01)
+    def resize(self, rows: int, cols: int):
+        if self.master_fd is None:
+            return
+        size = struct.pack("HHHH", rows, cols, 0, 0)
+        fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, size)
 
-    def _read_chunk(self, size: int = 4096) -> bytes:
-        try:
-            return os.read(self.master_fd, size)
-        except BlockingIOError:
-            return b""
-        except OSError:
-            return b""
+    def subscribe(self, send_fn: Callable):
+        self._subscribers.add(send_fn)
+
+    def unsubscribe(self, send_fn: Callable):
+        self._subscribers.discard(send_fn)
 
     def close(self):
-        """Kill the child process and close the PTY."""
-        if self._read_task and not self._read_task.done():
-            self._read_task.cancel()
-        if self.pid:
-            try:
-                os.kill(self.pid, signal.SIGKILL)
-                os.waitpid(self.pid, 0)
-            except (ProcessLookupError, ChildProcessError):
-                pass
         if self.master_fd is not None:
             try:
+                loop = asyncio.get_event_loop()
+                loop.remove_reader(self.master_fd)
                 os.close(self.master_fd)
             except OSError:
                 pass
-        self.master_fd = None
-        self.pid = None
+            self.master_fd = None
+        if self._proc:
+            self._proc.terminate()
+            self._proc = None
 
 
-# One terminal per session (keyed by WebSocket id)
-_terminals: dict[str, PtyTerminal] = {}
+# App-level singleton (created on first terminal connection)
+_session: PtySession | None = None
 
 
-def get_terminal(session_id: str) -> PtyTerminal:
-    if session_id not in _terminals:
-        _terminals[session_id] = PtyTerminal()
-    return _terminals[session_id]
-
-
-def close_terminal(session_id: str):
-    if session_id in _terminals:
-        _terminals[session_id].close()
-        del _terminals[session_id]
+async def get_pty() -> PtySession:
+    global _session
+    if _session is None:
+        _session = PtySession()
+        await _session.start()
+    return _session

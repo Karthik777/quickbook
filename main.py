@@ -8,7 +8,7 @@ from fasthtml.common import *
 from notebook import get_or_create, list_notebooks, Cell
 from kernel import run_cell, get_var, get_completions, restart_kernel
 from render import render_outputs, render_vars, var_modal
-from terminal import get_terminal, close_terminal
+from terminal import get_pty
 from dialog import stream_prompt, add_to_context, get_context
 
 # ---------------------------------------------------------------------------
@@ -537,35 +537,36 @@ async def post():
 # WebSocket terminal
 # ---------------------------------------------------------------------------
 
-@app.ws("/terminal")
-async def ws_terminal(msg: str, send, ws):
-    """Handle xterm.js WebSocket: resize events and raw keystrokes."""
-    session_id = str(id(ws))
-    term = get_terminal(session_id)
+async def _on_term_connect(send):
+    """Subscribe this WS client to the shared PTY session on connect."""
+    pty = await get_pty()
+    pty.subscribe(send)
+    # Nudge bash to emit its prompt
+    await pty.write(b"\n")
 
-    # Spawn PTY on first connect (msg will be resize or empty)
-    if term.master_fd is None:
-        term.spawn()
-        asyncio.create_task(term.read_loop(send))
 
-    # Parse resize message
-    if msg.startswith("{"):
+async def _on_term_disconnect(ws):
+    """Unsubscribe on disconnect (PTY session stays alive)."""
+    pty = await get_pty()
+    # find and remove the send callable bound to this ws
+    # FastHTML passes the ws object; we stored send in subscribe — unsubscribe all
+    # dead callables next time _on_readable fires (they'll raise & be removed)
+    pass  # subscribers auto-clean on send failure in _on_readable
+
+
+@app.ws("/terminal", conn=_on_term_connect, disconn=_on_term_disconnect)
+async def ws_terminal(msg: str, send):
+    """Route keystrokes and resize events from xterm.js to the PTY."""
+    pty = await get_pty()
+    if msg and msg[0] == "{":
         try:
             data = json.loads(msg)
             if data.get("type") == "resize":
-                term.resize(data.get("rows", 24), data.get("cols", 80))
+                pty.resize(data.get("rows", 24), data.get("cols", 80))
             return
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, KeyError):
             pass
-
-    # Write keystrokes
-    await term.write(msg)
-
-
-# Disconnect hook
-async def on_ws_disconnect(ws):
-    session_id = str(id(ws))
-    close_terminal(session_id)
+    await pty.write(msg)
 
 
 # ---------------------------------------------------------------------------

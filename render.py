@@ -102,6 +102,11 @@ def render_vars(new_vars: dict, changed_vars: dict) -> FT:
                     A("⬡", hx_get=f"/inspect/{k}", hx_target="#modal",
                       hx_swap="innerHTML", cls="inspect-link", title="Inspect"),
                 ),
+                # Lazy-load detail on first open; cached in DOM after that
+                hx_get=f"/inspect/{k}",
+                hx_target="#modal",
+                hx_swap="innerHTML",
+                hx_trigger="toggle once",
                 cls="var-item"
             )
         )
