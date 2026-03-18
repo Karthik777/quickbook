@@ -494,7 +494,7 @@ async def post(cell_id: str):
         o.get("data", {}).get("text/plain", o.get("text", ""))
         for o in cell.outputs if isinstance(o, dict)
     )
-    add_to_context("user", f"```\n{cell.source}\n```\nOutput:\n{content}")
+    await add_to_context("user", f"```\n{cell.source}\n```\nOutput:\n{content}")
     return "✓ Added to context"
 
 

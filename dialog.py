@@ -1,5 +1,4 @@
 """LLM context management using lisette + optional dialoghelper."""
-import asyncio
 from typing import AsyncIterator
 
 try:
@@ -17,31 +16,35 @@ except ImportError:
     HAS_DIALOGHELPER = False
 
 # In-memory conversation context: list of {"role": ..., "content": ...}
+# Used as fallback when dialoghelper is not installed.
 _context: list[dict] = []
 
+# msg_type values for dialoghelper: 'code', 'note', 'prompt'
+_ROLE_TO_MSGTYPE = {"user": "note", "assistant": "note", "code": "code", "prompt": "prompt"}
 
-def add_to_context(role: str, content: str):
+
+async def add_to_context(role: str, content: str):
     """Add a message to the LLM conversation context."""
     if HAS_DIALOGHELPER:
-        add_msg(content, role=role)
+        msg_type = _ROLE_TO_MSGTYPE.get(role, "note")
+        await add_msg(content, msg_type=msg_type)
     else:
         _context.append({"role": role, "content": content})
 
 
-def update_context(idx: int, content: str):
+async def update_context(msg_id: str, content: str):
     if HAS_DIALOGHELPER:
-        update_msg(idx, content)
+        await update_msg(id=msg_id, content=content)
     else:
-        if 0 <= idx < len(_context):
-            _context[idx]["content"] = content
+        # fallback: no-op (no stable id in plain list)
+        pass
 
 
-def delete_from_context(idx: int):
+async def delete_from_context(msg_id: str):
     if HAS_DIALOGHELPER:
-        del_msg(idx)
+        await del_msg(id=msg_id)
     else:
-        if 0 <= idx < len(_context):
-            _context.pop(idx)
+        pass
 
 
 def get_context() -> list[dict]:
@@ -54,9 +57,6 @@ async def stream_prompt(prompt: str) -> AsyncIterator[str]:
         yield "[lisette not installed — run: pip install lisette]\n"
         return
 
-    # Build messages from context + new prompt
-    messages = list(_context) + [{"role": "user", "content": prompt}]
-
     try:
         res = await _chat(prompt, stream=True)
         full = ""
@@ -64,7 +64,7 @@ async def stream_prompt(prompt: str) -> AsyncIterator[str]:
             text = chunk if isinstance(chunk, str) else getattr(chunk, "text", "")
             full += text
             yield text
-        # Add to context after completion
+        # Persist to context after completion
         _context.append({"role": "user", "content": prompt})
         _context.append({"role": "assistant", "content": full})
     except Exception as e:
